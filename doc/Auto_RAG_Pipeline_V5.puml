@@ -1,0 +1,967 @@
+@startuml Auto_RAG_Pipeline_V5
+
+skinparam monochrome false
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam groupInheritance 2
+skinparam ArrowColor #555555
+skinparam PackageBorderColor #AAAAAA
+
+title Enterprise Auto-RAG Pipeline — Architectural Blueprint V5\n(Hexagonal Architecture · Pipes & Filters · Rich Domain · ACL · Domain Events · Index Versioning)
+
+' ╔══════════════════════════════════════════════════════════════════════╗
+' ║  LAYER 1 — DOMAIN CORE                                              ║
+' ║  No imports from any external library or infrastructure.            ║
+' ║  All other layers depend inward on this layer; this layer           ║
+' ║  depends on nothing outside itself.                                 ║
+' ╚══════════════════════════════════════════════════════════════════════╝
+package "Domain Core" #FFFDE7 {
+
+    ' ── Enums & Value Objects ──────────────────────────────────────────
+
+    enum SourceType {
+        SINGLE_URL
+        WEBSITE_CRAWL
+        SINGLE_FILE
+        DIRECTORY_FOLDER
+    }
+
+    enum IngestionStatus {
+        PENDING
+        INGESTED
+        STALE
+        FAILED
+    }
+
+    ' Value Object — identity by content_hash, immutable after creation.
+    class Provenance <<ValueObject>> {
+        + source_path: str
+        + source_type: SourceType
+        + file_name: str
+        + file_extension: str
+        + page_number: Optional[int]
+        + total_pages: Optional[int]
+        + char_offset_start: int
+        + char_offset_end: int
+        + language: Optional[str]
+        + scraped_at: datetime
+    }
+
+    ' Value Object — immutable, equality by all fields.
+    class ChunkId <<ValueObject>> {
+        + value: str
+        ' Derived: sha256(source_path + char_offset_start + content_hash)
+    }
+
+    ' Value Object — immutable after creation.
+    class Chunk <<ValueObject>> {
+        + id: ChunkId
+        + text: str
+        + content_hash: str
+        + word_count: int
+        + provenance: Provenance
+        + is_valid(): bool
+        ' Domain rule: text must be non-empty and word_count > 0
+    }
+
+    ' Entity — has identity (DocumentId), mutable lifecycle state.
+    class DocumentId <<ValueObject>> {
+        + value: str
+        ' Derived: sha256(source_path)
+    }
+
+    ' Aggregate Root — owns all chunks for one source file.
+    ' Enforces invariants: no duplicate ChunkIds, status transitions valid.
+    class SourceDocument <<AggregateRoot>> {
+        + id: DocumentId
+        + source_path: str
+        + content_hash: str
+        + status: IngestionStatus
+        + indexed_at: Optional[datetime]
+        + index_version_id: Optional[str]
+        + chunks(): List[Chunk]
+        + mark_ingested(version_id: str): void
+        + mark_stale(): void
+        + mark_failed(reason: str): void
+        + add_chunk(chunk: Chunk): void
+        + is_changed(new_hash: str): bool
+        ' Domain rule: can only transition PENDING→INGESTED, INGESTED→STALE,
+        '              STALE→INGESTED, any→FAILED. Invalid transitions raise DomainException.
+    }
+
+    ' Value Object — describes a specific index configuration snapshot.
+    class IndexVersion <<ValueObject>> {
+        + version_id: str
+        + embedding_model: str
+        + embedding_provider: str
+        + chunker_strategy: str
+        + chunk_size: int
+        + chunk_overlap: int
+        + created_at: datetime
+        + is_compatible_with(other: IndexVersion): bool
+        ' Two versions are compatible if embedding_model and chunker_strategy match.
+    }
+
+    enum IndexVersionStatus {
+        BUILDING
+        ACTIVE
+        DEPRECATED
+    }
+
+    ' Evaluation domain objects — pure measurement, no policy.
+    class EvaluationCase <<ValueObject>> {
+        + query: str
+        + expected_answer: str
+        + pre_retrieved_contexts: List[str]
+        ' Contexts are captured offline — no live retriever needed during evaluation.
+    }
+
+    class EvaluationDataset <<ValueObject>> {
+        + dataset_id: str
+        + cases: List[EvaluationCase]
+        + captured_at: datetime
+        + index_version_id: str
+    }
+
+    class EvaluationMetrics <<ValueObject>> {
+        + context_precision: float
+        + faithfulness: float
+        + answer_relevance: float
+    }
+
+    ' Policy object — owns threshold logic, separate from measurement.
+    class EvaluationPolicy <<ValueObject>> {
+        + min_context_precision: float
+        + min_faithfulness: float
+        + min_answer_relevance: float
+        + evaluate(metrics: EvaluationMetrics): bool
+        ' Returns True only when all three thresholds are met.
+    }
+
+    ' ── Domain Events ─────────────────────────────────────────────────
+    ' Events are immutable facts that something happened in the domain.
+    ' Stages publish events; downstream stages subscribe — no direct calls.
+
+    abstract class DomainEvent <<abstract>> {
+        + event_id: str
+        + occurred_at: datetime
+        + correlation_id: str
+    }
+
+    class DocumentDiscovered extends DomainEvent {
+        + source_path: str
+        + file_size_bytes: int
+        + source_type: SourceType
+    }
+
+    class DocumentSkipped extends DomainEvent {
+        + source_path: str
+        + reason: str
+        ' Reasons: UNCHANGED_HASH | FILE_TOO_LARGE | UNSUPPORTED_EXTENSION
+    }
+
+    class DocumentScraped extends DomainEvent {
+        + document: SourceDocument
+        + raw_text: str
+    }
+
+    class DocumentChunked extends DomainEvent {
+        + document_id: DocumentId
+        + chunks: List[Chunk]
+    }
+
+    class ChunksEmbedded extends DomainEvent {
+        + document_id: DocumentId
+        + vector_payloads: List[VectorPayload]
+        + index_version_id: str
+    }
+
+    class DocumentIngested extends DomainEvent {
+        + document_id: DocumentId
+        + chunk_count: int
+        + index_version_id: str
+    }
+
+    class DocumentMarkedStale extends DomainEvent {
+        + document_id: DocumentId
+        + stale_chunk_ids: List[ChunkId]
+    }
+
+    class IngestionFailed extends DomainEvent {
+        + source_path: str
+        + stage: str
+        + error: PipelineError
+    }
+
+    class EvaluationCompleted extends DomainEvent {
+        + dataset_id: str
+        + metrics: EvaluationMetrics
+        + passed: bool
+        + index_version_id: str
+    }
+
+    class IndexVersionActivated extends DomainEvent {
+        + version_id: str
+        + previous_version_id: Optional[str]
+    }
+
+    ' ── Error type ────────────────────────────────────────────────────
+    class PipelineError <<ValueObject>> {
+        + stage: str
+        + source_path: Optional[str]
+        + message: str
+        + retryable: bool
+        + original_exception: Optional[str]
+    }
+
+    ' ── Infrastructure transfer objects (live at domain boundary) ─────
+    class VectorPayload <<ValueObject>> {
+        + chunk_id: ChunkId
+        + vector: List[float]
+        + text: str
+        + provenance: Provenance
+        + index_version_id: str
+    }
+
+    class QueryRequest <<ValueObject>> {
+        + query_text: str
+        + top_k: int
+        + index_version_id: str
+    }
+
+    class RetrievalResult <<ValueObject>> {
+        + text: str
+        + score: float
+        + provenance: Provenance
+        + chunk_id: ChunkId
+    }
+}
+
+' ╔══════════════════════════════════════════════════════════════════════╗
+' ║  LAYER 2 — PORTS (Interfaces defined at the application boundary)  ║
+' ║  Domain Core depends on nothing here.                              ║
+' ║  Adapters (Layer 4) implement these; use cases (Layer 3) call them.║
+' ╚══════════════════════════════════════════════════════════════════════╝
+package "Ports (Interfaces)" #E8F5E9 {
+
+    ' ── Inbound Ports (Driving) — how the outside world starts use cases ──
+
+    interface IngestSourcePort <<InboundPort>> {
+        + async execute(cmd: IngestSourceCommand): void
+    }
+
+    interface EvaluatePipelinePort <<InboundPort>> {
+        + async execute(cmd: EvaluatePipelineCommand): EvaluationMetrics
+    }
+
+    interface CleanStaleDocumentsPort <<InboundPort>> {
+        + async execute(cmd: CleanStaleDocumentsCommand): void
+    }
+
+    interface PromoteIndexVersionPort <<InboundPort>> {
+        + async execute(cmd: PromoteIndexVersionCommand): void
+    }
+
+    ' ── Outbound Ports (Driven) — what the use cases need from infrastructure ──
+
+    ' Scraping port — streams domain events, never raw text.
+    interface ScraperPort <<OutboundPort>> {
+        + async stream(
+            config: ScraperConfig,
+            concurrency: ConcurrencyPolicy,
+            crawl_filter: CrawlFilter
+          ): AsyncIterator[DocumentScraped | DocumentSkipped | IngestionFailed]
+    }
+
+    interface ChunkerPort <<OutboundPort>> {
+        + split(document: SourceDocument, config: ChunkerConfig): List[Chunk]
+    }
+
+    interface EmbedderPort <<OutboundPort>> {
+        + async embed(
+            chunks: List[Chunk],
+            config: EmbedderConfig
+          ): List[VectorPayload]
+        ' ACL: translates Chunk → provider SDK format internally.
+    }
+
+    interface VectorStorePort <<OutboundPort>> {
+        + async upsert(payloads: List[VectorPayload], version_id: str): void
+        + async delete_by_chunk_ids(ids: List[ChunkId], version_id: str): void
+    }
+
+    interface RetrieverPort <<OutboundPort>> {
+        + async retrieve(request: QueryRequest): List[RetrievalResult]
+        ' ACL: translates QueryRequest → provider SDK format internally.
+    }
+
+    interface EvaluatorPort <<OutboundPort>> {
+        + async evaluate(
+            dataset: EvaluationDataset,
+            config: EvaluatorConfig
+          ): EvaluationMetrics
+        ' Operates on pre-captured EvaluationDataset — no live retriever dependency.
+    }
+
+    interface ReporterPort <<OutboundPort>> {
+        + async report(
+            metrics: EvaluationMetrics,
+            passed: bool,
+            config: ReporterConfig
+          ): void
+    }
+
+    interface DocumentRepositoryPort <<OutboundPort>> {
+        + async find_by_path(path: str): Optional[SourceDocument]
+        + async save(document: SourceDocument): void
+        + async find_stale(): List[SourceDocument]
+        + async find_all_paths(): List[str]
+    }
+
+    interface IndexVersionRegistryPort <<OutboundPort>> {
+        + async create(version: IndexVersion): void
+        + async activate(version_id: str): IndexVersion
+        + async deprecate(version_id: str): void
+        + async get_active(): IndexVersion
+        + async get_status(version_id: str): IndexVersionStatus
+    }
+
+    interface EventBusPort <<OutboundPort>> {
+        + async publish(event: DomainEvent): void
+        + subscribe(event_type: Type[DomainEvent], handler: EventHandler): void
+    }
+
+    interface ErrorHandlerPort <<OutboundPort>> {
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+
+    interface ProgressReporterPort <<OutboundPort>> {
+        + on_event(event: DomainEvent): void
+        + on_run_complete(metrics: ScraperRunMetrics): void
+    }
+
+    ' ── Policy Ports — replaceable decision strategies ─────────────────
+
+    interface CrawlFilter <<Policy>> {
+        + should_include(path: Path, registry: FileExtractorRegistry): bool
+        ' Registry is the single source of truth for supported extensions.
+    }
+
+    interface ConcurrencyPolicy <<Policy>> {
+        + max_concurrent_files(): int
+        + max_file_size_mb(): float
+        + encoding_fallbacks(): List[str]
+    }
+
+    interface TextPreprocessor <<Policy>> {
+        + process(text: str, provenance: Provenance): str
+    }
+
+    interface FileExtractor <<Policy>> {
+        + supported_extensions: List[str]
+        + async extract(path: Path, provenance: Provenance): str
+    }
+
+    ' ── Pipeline Filter port (Pipes & Filters pattern) ─────────────────
+    ' Each stage is a Filter — transforms an async stream.
+    ' The pipeline composes filters; order is declarative, not hardcoded.
+
+    interface PipelineFilter<TIn, TOut> <<Protocol>> {
+        + async process(
+            stream: AsyncIterator[TIn]
+          ): AsyncIterator[TOut]
+    }
+}
+
+' ╔══════════════════════════════════════════════════════════════════════╗
+' ║  LAYER 3 — APPLICATION (Use Cases)                                 ║
+' ║  Orchestrates domain objects and calls outbound ports.             ║
+' ║  One class per use case — Single Responsibility enforced here.     ║
+' ╚══════════════════════════════════════════════════════════════════════╝
+package "Application Layer (Use Cases)" #E3F2FD {
+
+    ' ── Commands (inbound DTOs — what the caller wants) ────────────────
+
+    class IngestSourceCommand {
+        + scraper_cfg: ScraperConfig
+        + chunker_cfg: ChunkerConfig
+        + embedder_cfg: EmbedderConfig
+        + crawl_filter: CrawlFilter
+        + concurrency: ConcurrencyPolicy
+        + target_version_id: str
+    }
+
+    class EvaluatePipelineCommand {
+        + dataset: EvaluationDataset
+        + evaluator_cfg: EvaluatorConfig
+        + reporter_cfg: ReporterConfig
+        + policy: EvaluationPolicy
+    }
+
+    class CleanStaleDocumentsCommand {
+        + active_source_paths: List[str]
+        + version_id: str
+    }
+
+    class PromoteIndexVersionCommand {
+        + candidate_version_id: str
+        + evaluation_dataset: EvaluationDataset
+        + evaluator_cfg: EvaluatorConfig
+        + policy: EvaluationPolicy
+    }
+
+    ' ── Use Case: Ingest ───────────────────────────────────────────────
+    ' Composes the Pipes & Filters pipeline declaratively.
+    ' Subscribes to domain events from EventBus to advance SourceDocument state.
+
+    class IngestSourceUseCase implements IngestSourcePort {
+        - scraper: ScraperPort
+        - pipeline: FilterPipeline
+        - doc_repo: DocumentRepositoryPort
+        - index_registry: IndexVersionRegistryPort
+        - event_bus: EventBusPort
+        - error_handler: ErrorHandlerPort
+        - progress: ProgressReporterPort
+        + async execute(cmd: IngestSourceCommand): void
+        ' 1. Verify target version exists and is BUILDING or ACTIVE.
+        ' 2. scraper.stream() → raw domain events into FilterPipeline.
+        ' 3. FilterPipeline: ScraperFilter | ChunkerFilter | EmbedderFilter | StoreFilter
+        ' 4. Each filter publishes domain event on success; IngestionFailed on error.
+        ' 5. EventBus handler updates SourceDocument status in DocumentRepository.
+        ' 6. error_handler.handle() consulted when IngestionFailed received.
+    }
+
+    ' ── Use Case: Evaluate ─────────────────────────────────────────────
+    ' No live retriever — operates on pre-captured EvaluationDataset.
+
+    class EvaluatePipelineUseCase implements EvaluatePipelinePort {
+        - evaluator: EvaluatorPort
+        - reporter: ReporterPort
+        - event_bus: EventBusPort
+        + async execute(cmd: EvaluatePipelineCommand): EvaluationMetrics
+        ' 1. evaluator.evaluate(cmd.dataset, cmd.evaluator_cfg) → raw EvaluationMetrics
+        ' 2. passed = cmd.policy.evaluate(metrics)   ← policy applied here, not inside evaluator
+        ' 3. reporter.report(metrics, passed, cmd.reporter_cfg)
+        ' 4. publish EvaluationCompleted event
+    }
+
+    ' ── Use Case: Clean Stale ──────────────────────────────────────────
+
+    class CleanStaleDocumentsUseCase implements CleanStaleDocumentsPort {
+        - doc_repo: DocumentRepositoryPort
+        - vector_store: VectorStorePort
+        - event_bus: EventBusPort
+        + async execute(cmd: CleanStaleDocumentsCommand): void
+        ' 1. doc_repo.find_stale() → stale SourceDocuments
+        ' 2. For each: collect chunk_ids → vector_store.delete_by_chunk_ids()
+        ' 3. doc_repo.save(document.mark_stale())
+        ' 4. publish DocumentMarkedStale event
+    }
+
+    ' ── Use Case: Promote Index Version ────────────────────────────────
+    ' Blue/green promotion: evaluate candidate, then atomically activate.
+
+    class PromoteIndexVersionUseCase implements PromoteIndexVersionPort {
+        - index_registry: IndexVersionRegistryPort
+        - evaluator: EvaluatorPort
+        - event_bus: EventBusPort
+        + async execute(cmd: PromoteIndexVersionCommand): void
+        ' 1. Verify candidate version status is BUILDING.
+        ' 2. evaluator.evaluate(cmd.evaluation_dataset) → metrics
+        ' 3. If policy passes: index_registry.activate(candidate)
+        '                      index_registry.deprecate(previous_active)
+        '                      publish IndexVersionActivated
+        ' 4. If policy fails:  leave candidate as BUILDING, publish EvaluationCompleted(passed=False)
+    }
+
+    ' ── Pipes & Filters Orchestrator ───────────────────────────────────
+    ' Composes PipelineFilter instances in declared order.
+    ' Order is data — change without touching any filter implementation.
+
+    class FilterPipeline {
+        - filters: List[PipelineFilter]
+        + add(filter: PipelineFilter): FilterPipeline
+        + async run(source: AsyncIterator): AsyncIterator
+        ' Chains: source → filter[0] → filter[1] → ... → filter[n]
+        ' Each filter receives the output stream of the previous one.
+    }
+
+    ' ── Configs (application-layer DTOs) ───────────────────────────────
+
+    class ScraperConfig {
+        + target_path_or_url: str
+        + source_type: SourceType
+        + crawl_depth: int = 1
+        + preprocessors: List[TextPreprocessor]
+    }
+
+    class ChunkerConfig {
+        + strategy_name: str
+        + chunk_size: int
+        + chunk_overlap: int
+    }
+
+    class EmbedderConfig {
+        + provider: str
+        + model_name: str
+        + batch_size: int = 100
+    }
+
+    class EvaluatorConfig {
+        + llm_judge_model_name: str
+        + temperature: float
+    }
+
+    class ReporterConfig {
+        + output_path: str
+        + emit_to_slack: bool
+        + s3_bucket: Optional[str]
+    }
+}
+
+' ╔══════════════════════════════════════════════════════════════════════╗
+' ║  LAYER 4 — ADAPTERS (Infrastructure)                               ║
+' ║  Implements ports. Allowed to import external SDKs.                ║
+' ║  Contains Anti-Corruption Layers at every external boundary.       ║
+' ╚══════════════════════════════════════════════════════════════════════╝
+package "Adapters (Infrastructure)" #FCE4EC {
+
+    ' ── Scraper Subsystem ──────────────────────────────────────────────
+
+    class FileExtractorRegistry {
+        - extractors: List[FileExtractor]
+        + register(extractor: FileExtractor): void
+        + get(extension: str): FileExtractor
+        + supported_extensions(): List[str]
+        ' Single source of truth for supported file types.
+        ' CrawlFilter consults this — no duplication in ScraperConfig.
+    }
+
+    class PdfExtractor implements FileExtractor {
+        + supported_extensions: [".pdf"]
+        + async extract(path, provenance): str
+        ' pdfplumber in thread-pool executor — non-blocking.
+        ' Sets provenance.page_number and total_pages per page.
+    }
+
+    class TextExtractor implements FileExtractor {
+        + supported_extensions: [".txt", ".log", ".csv"]
+        + async extract(path, provenance): str
+        ' Tries ConcurrencyPolicy.encoding_fallbacks() in order.
+    }
+
+    class DocxExtractor implements FileExtractor {
+        + supported_extensions: [".docx"]
+        + async extract(path, provenance): str
+    }
+
+    class HtmlExtractor implements FileExtractor {
+        + supported_extensions: [".html", ".htm"]
+        + async extract(path, provenance): str
+        ' trafilatura for boilerplate removal.
+    }
+
+    class MarkdownExtractor implements FileExtractor {
+        + supported_extensions: [".md", ".mdx"]
+        + async extract(path, provenance): str
+    }
+
+    class FooterStripper implements TextPreprocessor
+    class WhitespaceNormalizer implements TextPreprocessor
+    class LanguageDetector implements TextPreprocessor
+    class PiiRedactor implements TextPreprocessor
+
+    class PreprocessorPipeline implements TextPreprocessor {
+        - steps: List[TextPreprocessor]
+        + process(text, provenance): str
+    }
+
+    class ExtensionCrawlFilter implements CrawlFilter {
+        + should_include(path, registry): bool
+        ' Delegates to registry.supported_extensions() — no hardcoded list.
+    }
+
+    class AdaptiveConcurrencyPolicy implements ConcurrencyPolicy {
+        + max_concurrent_files(): int
+        ' Monitors memory pressure; backs off concurrency if RSS > threshold.
+    }
+
+    class FixedConcurrencyPolicy implements ConcurrencyPolicy {
+        - _max_concurrent: int = 10
+        - _max_file_size_mb: float = 50.0
+        - _encoding_fallbacks: List[str]
+        + max_concurrent_files(): int
+        + max_file_size_mb(): float
+        + encoding_fallbacks(): List[str]
+    }
+
+    class LocalFileSystemScraper implements ScraperPort {
+        - registry: FileExtractorRegistry
+        - state_store: DocumentRepositoryPort
+        + async stream(config, concurrency, crawl_filter):
+            AsyncIterator[DocumentScraped | DocumentSkipped | IngestionFailed]
+        ' Walk → hash check via doc_repo → semaphore → extract → preprocess → emit event.
+        ' Stale detection: doc_repo.find_by_path() + SourceDocument.is_changed(hash).
+    }
+
+    class PlaywrightWebScraper implements ScraperPort {
+        + async stream(config, concurrency, crawl_filter):
+            AsyncIterator[DocumentScraped | DocumentSkipped | IngestionFailed]
+    }
+
+    ' ── Pipeline Filters ───────────────────────────────────────────────
+
+    class ChunkerFilter implements PipelineFilter {
+        ' TIn: DocumentScraped | DocumentSkipped | IngestionFailed
+        ' TOut: DocumentChunked | DocumentSkipped | IngestionFailed
+        - chunker_port: ChunkerPort
+        - config: ChunkerConfig
+    }
+
+    class EmbedderFilter implements PipelineFilter {
+        ' TIn: DocumentChunked | passthrough
+        ' TOut: ChunksEmbedded | IngestionFailed
+        ' ACL inside: Chunk → OpenAI/Cohere SDK format → VectorPayload
+        - embedder_port: EmbedderPort
+        - config: EmbedderConfig
+    }
+
+    class VectorStoreFilter implements PipelineFilter {
+        ' TIn: ChunksEmbedded | passthrough
+        ' TOut: DocumentIngested | IngestionFailed
+        - store_port: VectorStorePort
+    }
+
+    ' ── Embedder ACL ───────────────────────────────────────────────────
+    ' ACL: domain Chunk never imports from openai SDK.
+    ' Adapter translates at the boundary; SDK types never cross into domain.
+
+    class OpenAIEmbedderAdapter implements EmbedderPort {
+        - acl: OpenAIEmbedderACL
+        + async embed(chunks, config): List[VectorPayload]
+    }
+
+    class OpenAIEmbedderACL {
+        + to_request(chunks: List[Chunk], model: str): OpenAIEmbedRequest
+        + from_response(response: OpenAIEmbedResponse, chunks: List[Chunk]): List[VectorPayload]
+    }
+
+    ' ── Vector Store ACL ───────────────────────────────────────────────
+
+    class PineconeVectorStoreAdapter implements VectorStorePort {
+        - acl: PineconeACL
+        - connection_pool: AsyncConnectionPool
+        + async upsert(payloads, version_id): void
+        + async delete_by_chunk_ids(ids, version_id): void
+    }
+
+    class PineconeACL {
+        + to_upsert_request(payload: VectorPayload): PineconeUpsertRecord
+        + to_delete_request(ids: List[ChunkId]): PineconeDeleteRequest
+        + from_query_response(response: PineconeQueryResponse): List[RetrievalResult]
+    }
+
+    ' ── Retriever ACL ──────────────────────────────────────────────────
+
+    class PineconeRetrieverAdapter implements RetrieverPort {
+        - acl: PineconeACL
+        - connection_pool: AsyncConnectionPool
+        + async retrieve(request: QueryRequest): List[RetrievalResult]
+    }
+
+    ' Decorator — wraps any RetrieverPort, re-scores with Cohere.
+    class CohereReRankerAdapter implements RetrieverPort {
+        - inner: RetrieverPort
+        - acl: CohereReRankerACL
+        + async retrieve(request: QueryRequest): List[RetrievalResult]
+    }
+
+    class CohereReRankerACL {
+        + to_rerank_request(results: List[RetrievalResult], query: str): CohereRerankRequest
+        + from_rerank_response(response: CohereRerankResponse): List[RetrievalResult]
+    }
+
+    ' ── Chunker ────────────────────────────────────────────────────────
+
+    class TokenChunkerAdapter implements ChunkerPort {
+        + split(document: SourceDocument, config: ChunkerConfig): List[Chunk]
+        ' Produces Chunk value objects with correct ChunkId and Provenance.
+    }
+
+    ' ── Evaluator ACL ──────────────────────────────────────────────────
+
+    class RagasEvaluatorAdapter implements EvaluatorPort {
+        - acl: RagasACL
+        + async evaluate(dataset: EvaluationDataset, config: EvaluatorConfig): EvaluationMetrics
+        ' Operates on pre-captured EvaluationDataset — no live retriever.
+    }
+
+    class RagasACL {
+        + to_ragas_dataset(dataset: EvaluationDataset): RagasDatasetFormat
+        + from_ragas_result(result: RagasResult): EvaluationMetrics
+    }
+
+    ' ── Reporter ───────────────────────────────────────────────────────
+
+    class MultiSinkReporterAdapter implements ReporterPort {
+        + async report(metrics, passed, config): void
+        - async _write_markdown(metrics, path): void
+        - async _post_slack(metrics, passed): void
+        - async _upload_s3(metrics, bucket): void
+    }
+
+    ' ── Document Repository ────────────────────────────────────────────
+
+    class SqliteDocumentRepository implements DocumentRepositoryPort {
+        + async find_by_path(path): Optional[SourceDocument]
+        + async save(document: SourceDocument): void
+        + async find_stale(): List[SourceDocument]
+        + async find_all_paths(): List[str]
+    }
+
+    class PostgresDocumentRepository implements DocumentRepositoryPort {
+        + async find_by_path(path): Optional[SourceDocument]
+        + async save(document: SourceDocument): void
+        + async find_stale(): List[SourceDocument]
+        + async find_all_paths(): List[str]
+    }
+
+    ' ── Index Version Registry ─────────────────────────────────────────
+
+    class SqliteIndexVersionRegistry implements IndexVersionRegistryPort {
+        + async create(version): void
+        + async activate(version_id): IndexVersion
+        + async deprecate(version_id): void
+        + async get_active(): IndexVersion
+        + async get_status(version_id): IndexVersionStatus
+    }
+
+    ' ── Event Bus ──────────────────────────────────────────────────────
+
+    class InMemoryEventBus implements EventBusPort {
+        ' Synchronous dispatch — development and testing.
+        - handlers: dict
+        + async publish(event): void
+        + subscribe(event_type, handler): void
+    }
+
+    class KafkaEventBus implements EventBusPort {
+        ' Async dispatch — production multi-worker deployments.
+        + async publish(event): void
+        + subscribe(event_type, handler): void
+    }
+
+    ' ── Error Handler ──────────────────────────────────────────────────
+
+    class RetryCircuitBreakerHandler implements ErrorHandlerPort {
+        - failure_counts: dict
+        - circuit_open_until: dict
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+
+    ' ── Progress Reporters ─────────────────────────────────────────────
+
+    class LoggingProgressReporter implements ProgressReporterPort {
+        + on_event(event: DomainEvent): void
+        + on_run_complete(metrics: ScraperRunMetrics): void
+    }
+
+    class PrometheusProgressReporter implements ProgressReporterPort {
+        + on_event(event: DomainEvent): void
+        + on_run_complete(metrics: ScraperRunMetrics): void
+    }
+}
+
+' ╔══════════════════════════════════════════════════════════════════════╗
+' ║  LAYER 5 — TESTING SUITE                                           ║
+' ║  Tests depend on ports (interfaces), never on concrete adapters.   ║
+' ║  All infra replaced with in-memory doubles.                        ║
+' ╚══════════════════════════════════════════════════════════════════════╝
+package "Testing Suite (CI/CD Quality Gates)" #F3E5F5 {
+
+    ' ── Unit Tests ─────────────────────────────────────────────────────
+    class TestIngestSourceUseCase <<UnitTest>>
+    class TestEvaluatePipelineUseCase <<UnitTest>>
+    class TestCleanStaleDocumentsUseCase <<UnitTest>>
+    class TestPromoteIndexVersionUseCase <<UnitTest>>
+    class TestFilterPipeline <<UnitTest>>
+    class TestSourceDocumentLifecycle <<UnitTest>>
+    class TestEvaluationPolicy <<UnitTest>>
+    class TestPreprocessorPipeline <<UnitTest>>
+    class TestFileExtractorRegistry <<UnitTest>>
+
+    ' ── Test Doubles (implement ports, never concrete adapters) ─────────
+
+    class MockScraperPort <<TestDouble>> implements ScraperPort {
+        + canned_events: List[DomainEvent]
+        + async stream(config, concurrency, crawl_filter): AsyncIterator
+        ' Yields canned_events; injects IngestionFailed at configured positions.
+    }
+
+    class InMemoryDocumentRepository <<TestDouble>> implements DocumentRepositoryPort {
+        + store: dict
+        + async find_by_path(path): Optional[SourceDocument]
+        + async save(document): void
+        + async find_stale(): List[SourceDocument]
+        + async find_all_paths(): List[str]
+    }
+
+    class InMemoryVectorStore <<TestDouble>> implements VectorStorePort {
+        + upserted: List[VectorPayload]
+        + deleted: List[ChunkId]
+        + async upsert(payloads, version_id): void
+        + async delete_by_chunk_ids(ids, version_id): void
+    }
+
+    class InMemoryRetriever <<TestDouble>> implements RetrieverPort {
+        + canned_results: List[RetrievalResult]
+        + async retrieve(request): List[RetrievalResult]
+    }
+
+    class InMemoryIndexVersionRegistry <<TestDouble>> implements IndexVersionRegistryPort {
+        + versions: dict
+        + async create(version): void
+        + async activate(version_id): IndexVersion
+        + async deprecate(version_id): void
+        + async get_active(): IndexVersion
+        + async get_status(version_id): IndexVersionStatus
+    }
+
+    class CapturingEventBus <<TestDouble>> implements EventBusPort {
+        + published: List[DomainEvent]
+        ' Lets tests assert: "exactly one DocumentIngested was published with chunk_count=5"
+        + async publish(event): void
+        + subscribe(event_type, handler): void
+    }
+
+    class CapturingProgressReporter <<TestDouble>> implements ProgressReporterPort {
+        + received_events: List[DomainEvent]
+        + final_metrics: Optional[ScraperRunMetrics]
+        + on_event(event): void
+        + on_run_complete(metrics): void
+    }
+
+    class StubErrorHandler <<TestDouble>> implements ErrorHandlerPort {
+        + captured_errors: List[PipelineError]
+        + circuit_open: bool = false
+        + async handle(error): void
+        + is_circuit_open(stage): bool
+    }
+}
+
+' =====================================================================
+' DEPENDENCY RULE ENFORCEMENT (all arrows point inward toward Domain)
+' =====================================================================
+
+' ── Ports depend on Domain ──────────────────────────────────────────
+ScraperPort ..> DocumentScraped
+ScraperPort ..> DocumentSkipped
+ScraperPort ..> IngestionFailed
+ChunkerPort ..> Chunk
+ChunkerPort ..> SourceDocument
+EmbedderPort ..> VectorPayload
+VectorStorePort ..> VectorPayload
+VectorStorePort ..> ChunkId
+RetrieverPort ..> QueryRequest
+RetrieverPort ..> RetrievalResult
+EvaluatorPort ..> EvaluationDataset
+EvaluatorPort ..> EvaluationMetrics
+DocumentRepositoryPort ..> SourceDocument
+IndexVersionRegistryPort ..> IndexVersion
+IndexVersionRegistryPort ..> IndexVersionStatus
+EventBusPort ..> DomainEvent
+
+' ── Use Cases depend on Ports (not Adapters) ────────────────────────
+IngestSourceUseCase *-- ScraperPort
+IngestSourceUseCase *-- FilterPipeline
+IngestSourceUseCase *-- DocumentRepositoryPort
+IngestSourceUseCase *-- IndexVersionRegistryPort
+IngestSourceUseCase *-- EventBusPort
+IngestSourceUseCase *-- ErrorHandlerPort
+IngestSourceUseCase *-- ProgressReporterPort
+IngestSourceUseCase ..> IngestSourceCommand
+
+EvaluatePipelineUseCase *-- EvaluatorPort
+EvaluatePipelineUseCase *-- ReporterPort
+EvaluatePipelineUseCase *-- EventBusPort
+EvaluatePipelineUseCase ..> EvaluatePipelineCommand
+EvaluatePipelineUseCase ..> EvaluationPolicy : "applies after measurement"
+
+CleanStaleDocumentsUseCase *-- DocumentRepositoryPort
+CleanStaleDocumentsUseCase *-- VectorStorePort
+CleanStaleDocumentsUseCase *-- EventBusPort
+CleanStaleDocumentsUseCase ..> CleanStaleDocumentsCommand
+
+PromoteIndexVersionUseCase *-- IndexVersionRegistryPort
+PromoteIndexVersionUseCase *-- EvaluatorPort
+PromoteIndexVersionUseCase *-- EventBusPort
+PromoteIndexVersionUseCase ..> PromoteIndexVersionCommand
+PromoteIndexVersionUseCase ..> EvaluationPolicy
+
+' ── Pipes & Filters composition ─────────────────────────────────────
+FilterPipeline o-- PipelineFilter : "chains"
+ChunkerFilter *-- ChunkerPort
+EmbedderFilter *-- EmbedderPort
+VectorStoreFilter *-- VectorStorePort
+
+' ── Adapters implement Ports ────────────────────────────────────────
+LocalFileSystemScraper *-- FileExtractorRegistry
+LocalFileSystemScraper *-- TextPreprocessor
+LocalFileSystemScraper ..> DocumentRepositoryPort : "checks hash"
+FileExtractorRegistry o-- FileExtractor : "routes extension"
+PreprocessorPipeline o-- TextPreprocessor : "chains steps"
+ExtensionCrawlFilter ..> FileExtractorRegistry
+
+OpenAIEmbedderAdapter *-- OpenAIEmbedderACL
+PineconeVectorStoreAdapter *-- PineconeACL
+PineconeRetrieverAdapter *-- PineconeACL
+CohereReRankerAdapter o-- RetrieverPort : "wraps inner"
+CohereReRankerAdapter *-- CohereReRankerACL
+RagasEvaluatorAdapter *-- RagasACL
+
+' ── Domain object relationships ─────────────────────────────────────
+SourceDocument *-- Chunk : "owns"
+SourceDocument *-- DocumentId
+SourceDocument ..> IngestionStatus
+Chunk *-- Provenance
+Chunk *-- ChunkId
+VectorPayload *-- Provenance
+VectorPayload *-- ChunkId
+RetrievalResult *-- Provenance
+RetrievalResult *-- ChunkId
+EvaluationDataset *-- EvaluationCase
+EvaluationPolicy ..> EvaluationMetrics : "evaluates"
+
+' ── Domain Events published per stage ───────────────────────────────
+DocumentScraped ..> SourceDocument
+DocumentChunked ..> Chunk
+ChunksEmbedded ..> VectorPayload
+DocumentIngested ..> DocumentId
+DocumentMarkedStale ..> ChunkId
+EvaluationCompleted ..> EvaluationMetrics
+IngestionFailed ..> PipelineError
+
+' ── Testing depends on Ports only ───────────────────────────────────
+TestIngestSourceUseCase ..> IngestSourceUseCase
+TestIngestSourceUseCase ..> MockScraperPort
+TestIngestSourceUseCase ..> InMemoryDocumentRepository
+TestIngestSourceUseCase ..> InMemoryVectorStore
+TestIngestSourceUseCase ..> CapturingEventBus
+TestIngestSourceUseCase ..> StubErrorHandler
+TestEvaluatePipelineUseCase ..> EvaluatePipelineUseCase
+TestEvaluatePipelineUseCase ..> InMemoryRetriever
+TestEvaluatePipelineUseCase ..> CapturingEventBus
+TestCleanStaleDocumentsUseCase ..> CleanStaleDocumentsUseCase
+TestCleanStaleDocumentsUseCase ..> InMemoryDocumentRepository
+TestCleanStaleDocumentsUseCase ..> InMemoryVectorStore
+TestPromoteIndexVersionUseCase ..> PromoteIndexVersionUseCase
+TestPromoteIndexVersionUseCase ..> InMemoryIndexVersionRegistry
+TestFilterPipeline ..> FilterPipeline
+TestSourceDocumentLifecycle ..> SourceDocument
+TestEvaluationPolicy ..> EvaluationPolicy
+
+@enduml

@@ -1,0 +1,325 @@
+@startuml Auto_RAG_Pipeline_V3
+
+' --- Configuration & Styling ---
+skinparam monochrome false
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam packageStyle rectangle
+
+title Enterprise Auto-RAG Pipeline — Architectural Blueprint V3\n(Scoped Configs · Async · Policy Separation · Error Handling)
+
+' =====================================================================
+' 1. DATA CONTRACTS
+' FIX: God-object AppConfig replaced with granular per-component configs.
+'      Each component receives only the sub-config it needs.
+' =====================================================================
+package "Data Contracts (Schemas)" {
+
+    ' --- Component-scoped configs (replaces monolithic AppConfig) ---
+    class ScraperConfig <<Pydantic.BaseModel>> {
+        + target_path_or_url: str
+        + source_type: SourceType
+        + crawl_depth: int = 1
+        + allowed_extensions: List[str]
+        + timeout_seconds: int = 30
+        + max_retries: int = 3
+    }
+
+    class ChunkerConfig <<Pydantic.BaseModel>> {
+        + strategy_name: str
+        + chunk_size: int
+        + chunk_overlap: int
+    }
+
+    class EmbedderConfig <<Pydantic.BaseModel>> {
+        + provider: str
+        + model_name: str
+        + batch_size: int = 100
+    }
+
+    class VectorStoreConfig <<Pydantic.BaseModel>> {
+        + url: str
+        + api_key: SecretStr
+        + index_name: str
+        + timeout_seconds: int = 10
+    }
+
+    ' FIX: Evaluation policy (threshold) separated from measurement config.
+    class EvaluatorConfig <<Pydantic.BaseModel>> {
+        + llm_judge_model_name: str
+        + temperature: float
+    }
+
+    ' FIX: New policy class — threshold logic lives here, not inside EvaluationMetrics.
+    class EvaluationPolicy <<Pydantic.BaseModel>> {
+        + min_context_precision: float = 0.7
+        + min_faithfulness: float = 0.8
+        + min_answer_relevance: float = 0.75
+        + evaluate(metrics: EvaluationMetrics): bool
+    }
+
+    class ReporterConfig <<Pydantic.BaseModel>> {
+        + output_path: str
+        + emit_to_slack: bool = false
+        + s3_bucket: Optional[str]
+    }
+
+    ' --- Domain objects ---
+    enum SourceType {
+        SINGLE_URL
+        WEBSITE_CRAWL
+        SINGLE_FILE
+        DIRECTORY_FOLDER
+    }
+
+    class DocumentChunk <<Pydantic.BaseModel>> {
+        + text: str
+        + metadata: dict
+    }
+
+    class VectorPayload <<Pydantic.BaseModel>> {
+        + chunk_id: str
+        + vector: List[float]
+        + text: str
+    }
+
+    class QueryTestPayload <<Pydantic.BaseModel>> {
+        + test_query_text: str
+        + expected_ground_truth: str
+        + top_k: int = 5
+    }
+
+    class RetrievalResult <<Pydantic.BaseModel>> {
+        + text: str
+        + score: float
+        + metadata: dict
+    }
+
+    ' FIX: EvaluationMetrics is pure measurement — no passed_threshold flag.
+    '      Policy evaluation is delegated to EvaluationPolicy.evaluate().
+    class EvaluationMetrics <<Pydantic.BaseModel>> {
+        + context_precision: float
+        + faithfulness: float
+        + answer_relevance: float
+    }
+
+    ' FIX: New — wraps a failed operation with context for retry/alerting.
+    class PipelineError <<Pydantic.BaseModel>> {
+        + stage: str
+        + message: str
+        + retryable: bool
+        + original_exception: Optional[str]
+    }
+}
+
+' =====================================================================
+' 2. FUNCTIONAL CONTRACTS (Python Protocols)
+' FIX: All methods are now async. Each interface accepts only its own
+'      scoped config, not the entire AppConfig god object.
+' =====================================================================
+package "Functional Contracts (Interfaces)" {
+
+    ' FIX: fetch_text is async; accepts only ScraperConfig.
+    interface Scraper <<Protocol>> {
+        + async fetch_text(config: ScraperConfig): str
+    }
+
+    interface Chunker <<Protocol>> {
+        + split(text: str, config: ChunkerConfig): List[DocumentChunk]
+    }
+
+    ' FIX: generate_embeddings is async; accepts only EmbedderConfig.
+    '      Batching is handled internally per batch_size in EmbedderConfig.
+    interface Embedder <<Protocol>> {
+        + async generate_embeddings(chunks: List[DocumentChunk], config: EmbedderConfig): List[VectorPayload]
+    }
+
+    ' FIX: VectorStore and Retriever remain SEPARATE interfaces.
+    '      This allows independent substitution (e.g. add a re-ranker
+    '      by wrapping only the Retriever slot).
+    interface VectorStore <<Protocol>> {
+        + async load_vectors(payloads: List[VectorPayload], config: VectorStoreConfig): void
+    }
+
+    interface Retriever <<Protocol>> {
+        + async retrieve_top_k(query: QueryTestPayload, config: VectorStoreConfig): List[RetrievalResult]
+    }
+
+    ' FIX: Evaluator returns raw EvaluationMetrics only — no policy baked in.
+    interface Evaluator <<Protocol>> {
+        + async evaluate_pipeline(engine: Retriever, tests: List[QueryTestPayload], config: EvaluatorConfig): EvaluationMetrics
+    }
+
+    ' FIX: Reporter interface is extensible — implementations can emit to
+    '      file, Slack, S3, etc., driven by ReporterConfig.
+    interface Reporter <<Protocol>> {
+        + async generate_report(metrics: EvaluationMetrics, passed: bool, config: ReporterConfig): void
+    }
+
+    ' FIX: New interface — cross-cutting error handling (retry, circuit breaker, alerting).
+    interface ErrorHandler <<Protocol>> {
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+}
+
+' =====================================================================
+' 3. PRODUCTION CONCRETE STRATEGIES
+' =====================================================================
+package "Production Concrete Strategies" {
+
+    class PlaywrightWebScraper implements Scraper {
+        + async fetch_text(config: ScraperConfig): str
+        ' Retries up to ScraperConfig.max_retries with exponential backoff
+    }
+
+    class TokenChunker implements Chunker
+
+    ' FIX: Async with internal batching controlled by EmbedderConfig.batch_size.
+    class OpenAIEmbeddingStrategy implements Embedder {
+        + async generate_embeddings(chunks: List[DocumentChunk], config: EmbedderConfig): List[VectorPayload]
+        ' Uses asyncio.gather over batches sized by config.batch_size
+    }
+
+    ' FIX: PineconeVectorStore now implements only VectorStore.
+    '      Retrieval is a separate class (PineconeRetriever) so each can
+    '      be substituted independently (e.g. wrap Retriever with a re-ranker).
+    class PineconeVectorStore implements VectorStore {
+        - connection_pool: AsyncConnectionPool
+        + async load_vectors(payloads: List[VectorPayload], config: VectorStoreConfig): void
+    }
+
+    class PineconeRetriever implements Retriever {
+        - connection_pool: AsyncConnectionPool
+        + async retrieve_top_k(query: QueryTestPayload, config: VectorStoreConfig): List[RetrievalResult]
+    }
+
+    ' FIX: Returns raw EvaluationMetrics; policy applied externally.
+    class RagasEvaluator implements Evaluator {
+        + async evaluate_pipeline(engine: Retriever, tests: List[QueryTestPayload], config: EvaluatorConfig): EvaluationMetrics
+    }
+
+    ' FIX: Multi-sink reporter — file, Slack, S3 driven by ReporterConfig.
+    class MultiSinkReporter implements Reporter {
+        + async generate_report(metrics: EvaluationMetrics, passed: bool, config: ReporterConfig): void
+        - async _write_markdown(metrics, path): void
+        - async _post_slack(metrics, passed): void
+        - async _upload_s3(metrics, bucket): void
+    }
+
+    ' FIX: New — implements retry with exponential backoff + circuit breaker.
+    class RetryCircuitBreakerHandler implements ErrorHandler {
+        - failure_counts: dict
+        - circuit_open_until: dict
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+
+    ' FIX: New — thin re-ranking wrapper (implements Retriever, delegates to inner).
+    class CohereReRanker implements Retriever {
+        - inner: Retriever
+        + async retrieve_top_k(query: QueryTestPayload, config: VectorStoreConfig): List[RetrievalResult]
+        ' Calls inner.retrieve_top_k(), then re-scores with Cohere Rerank API
+    }
+}
+
+' =====================================================================
+' 4. CONTEXT CORE (Orchestrator)
+' FIX: Constructor now accepts scoped configs per component slot, not AppConfig.
+'      Accepts EvaluationPolicy separately to keep measurement vs policy distinct.
+'      ErrorHandler injected for cross-cutting retry/circuit-breaker logic.
+'      run() is async.
+' =====================================================================
+package "Production Context Core" {
+    class AutoRAGPipeline {
+        - scraper: Scraper
+        - chunker: Chunker
+        - embedder: Embedder
+        - vector_db: VectorStore
+        - retriever: Retriever
+        - evaluator: Evaluator
+        - reporter: Reporter
+        - error_handler: ErrorHandler
+        - policy: EvaluationPolicy
+        + __init__(scraper, chunker, embedder, vector_db, retriever,\n          evaluator, reporter, error_handler, policy)
+        + async run(\n    scraper_cfg: ScraperConfig,\n    chunker_cfg: ChunkerConfig,\n    embedder_cfg: EmbedderConfig,\n    store_cfg: VectorStoreConfig,\n    eval_cfg: EvaluatorConfig,\n    reporter_cfg: ReporterConfig,\n    test_suite: List[QueryTestPayload]\n  ): void
+        ' Internally: try/except at each stage → error_handler.handle(PipelineError)
+        ' Policy applied after evaluation: passed = policy.evaluate(metrics)
+    }
+}
+
+' =====================================================================
+' 5. TESTING SUITE
+' FIX: Store and Retriever mocks are now separate, matching the split in prod.
+'      StubErrorHandler added to verify error-path branching in unit tests.
+' =====================================================================
+package "Testing Suite (CI/CD Quality Gates)" <<Cloud>> {
+
+    class TestAutoRAGPipeline <<UnitTest>>
+
+    class MockVectorStore <<TestMock>> implements VectorStore {
+        + saved_payloads: List[VectorPayload]
+        + async load_vectors(payloads, config): void
+    }
+
+    class MockRetriever <<TestMock>> implements Retriever {
+        + canned_results: List[RetrievalResult]
+        + async retrieve_top_k(query, config): List[RetrievalResult]
+        ' FIX: Separate from MockVectorStore — retriever can be swapped alone.
+    }
+
+    ' FIX: New — lets tests assert that error handling is invoked correctly.
+    class StubErrorHandler <<TestMock>> implements ErrorHandler {
+        + captured_errors: List[PipelineError]
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+}
+
+' =====================================================================
+' RELATIONSHIPS
+' =====================================================================
+
+' --- Structural composition ---
+AutoRAGPipeline *-- Scraper
+AutoRAGPipeline *-- Chunker
+AutoRAGPipeline *-- Embedder
+AutoRAGPipeline *-- VectorStore
+AutoRAGPipeline *-- Retriever
+AutoRAGPipeline *-- Evaluator
+AutoRAGPipeline *-- Reporter
+AutoRAGPipeline *-- ErrorHandler
+AutoRAGPipeline *-- EvaluationPolicy
+
+' --- Per-method scoped config dependencies (FIX: no more god-object AppConfig) ---
+AutoRAGPipeline ..> ScraperConfig   : "run() passes →"
+AutoRAGPipeline ..> ChunkerConfig   : "run() passes →"
+AutoRAGPipeline ..> EmbedderConfig  : "run() passes →"
+AutoRAGPipeline ..> VectorStoreConfig : "run() passes →"
+AutoRAGPipeline ..> EvaluatorConfig : "run() passes →"
+AutoRAGPipeline ..> ReporterConfig  : "run() passes →"
+AutoRAGPipeline ..> PipelineError   : "raises on stage failure"
+
+' --- Error routing ---
+AutoRAGPipeline ..> ErrorHandler : "delegates stage errors"
+
+' --- Policy gate (FIX: measurement ≠ policy) ---
+EvaluationPolicy ..> EvaluationMetrics : "evaluates raw metrics"
+
+' --- Retriever / method injection into Evaluator ---
+Retriever ..> QueryTestPayload   : "consumes"
+Retriever ..> RetrievalResult    : "produces"
+Evaluator ..> Retriever          : "method injection for validation tests"
+Evaluator ..> EvaluationMetrics  : "produces (raw, no threshold)"
+
+' --- Re-ranker wraps Retriever (decorator pattern) ---
+CohereReRanker o-- Retriever : "wraps inner"
+
+' --- Testing ---
+TestAutoRAGPipeline ..> AutoRAGPipeline
+TestAutoRAGPipeline ..> MockVectorStore
+TestAutoRAGPipeline ..> MockRetriever
+TestAutoRAGPipeline ..> StubErrorHandler
+
+@enduml

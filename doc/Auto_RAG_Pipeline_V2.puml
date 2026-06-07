@@ -1,0 +1,190 @@
+@startuml Auto_RAG_Pipeline_Master_Architecture_V2
+
+' --- Configuration & Styling ---
+skinparam monochrome false
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam packageStyle rectangle
+
+title Enterprise Auto-RAG Pipeline - Master Architectural Blueprint (with Segregated Retriever)
+
+' =====================================================================
+' 1. DATA CONTRACTS (Pydantic Models & State Types)
+' =====================================================================
+package "Data Contracts (Schemas)" {
+    enum SourceType {
+        SINGLE_URL
+        WEBSITE_CRAWL
+        SINGLE_FILE
+        DIRECTORY_FOLDER
+    }
+
+    class DatabaseConfig <<Pydantic.BaseModel>> {
+        + url: str
+        + api_key: SecretStr
+        + index_name: str
+    }
+
+    class ScraperConfig <<Pydantic.BaseModel>> {
+        + target_path_or_url: str
+        + source_type: SourceType
+        + crawl_depth: int = 1
+        + allowed_extensions: List[str]
+    }
+
+    class ChunkerConfig <<Pydantic.BaseModel>> {
+        + strategy_name: str
+        + chunk_size: int
+        + chunk_overlap: int
+    }
+
+    class LLMModelConfig <<Pydantic.BaseModel>> {
+        + embedding_provider: str
+        + embedding_model_name: str
+        + llm_judge_model_name: str
+        + temperature: float
+    }
+
+    class AppConfig <<Pydantic.BaseModel>> {
+        + environment: str
+        + db: DatabaseConfig
+        + scraper: ScraperConfig
+        + chunker: ChunkerConfig
+        + models: LLMModelConfig
+    }
+    
+    class DocumentChunk <<Pydantic.BaseModel>> {
+        + text: str
+        + metadata: dict
+    }
+    
+    class VectorPayload <<Pydantic.BaseModel>> {
+        + chunk_id: str
+        + vector: List[float]
+        + text: str
+    }
+
+    class QueryTestPayload <<Pydantic.BaseModel>> {
+        + test_query_text: str
+        + expected_ground_truth: str
+        + top_k: int = 5
+    }
+
+    class RetrievalResult <<Pydantic.BaseModel>> {
+        + text: str
+        + score: float
+        + metadata: dict
+    }
+    
+    class EvaluationMetrics <<Pydantic.BaseModel>> {
+        + context_precision: float
+        + faithfulness: float
+        + answer_relevance: float
+        + passed_threshold: bool
+    }
+}
+
+' =====================================================================
+' 2. FUNCTIONAL CONTRACTS (Python Protocols)
+' =====================================================================
+package "Functional Contracts (Interfaces)" {
+    interface Scraper <<Protocol>> {
+        + fetch_text(config: ScraperConfig): str
+    }
+    interface Chunker <<Protocol>> {
+        + split(text: str, config: ChunkerConfig): List[DocumentChunk]
+    }
+    interface Embedder <<Protocol>> {
+        + generate_embeddings(chunks: List[DocumentChunk], config: LLMModelConfig): List[VectorPayload]
+    }
+    interface VectorStore <<Protocol>> {
+        + load_vectors(payloads: List[VectorPayload], config: DatabaseConfig): void
+    }
+    interface Retriever <<Protocol>> {
+        + retrieve_top_k(query: QueryTestPayload, config: DatabaseConfig): List[RetrievalResult]
+    }
+    interface Evaluator <<Protocol>> {
+        + evaluate_pipeline(engine: Retriever, tests: List[QueryTestPayload], config: AppConfig): EvaluationMetrics
+    }
+    interface Reporter <<Protocol>> {
+        + generate_report(metrics: EvaluationMetrics): void
+    }
+}
+
+' =====================================================================
+' 3. PRODUCTION CONCRETE STRATEGIES
+' =====================================================================
+package "Production Concrete Strategies" {
+    class PlaywrightWebScraper implements Scraper
+    class TokenChunker implements Chunker
+    class OpenAIEmbeddingStrategy implements Embedder
+    
+    class PineconeVectorStore implements VectorStore, Retriever {
+        note: "Implements BOTH Ingestion and Retrieval contracts"
+        - connection_pool: Connection
+        + __init__(db_config: DatabaseConfig)
+        + load_vectors(payloads: List[VectorPayload], config: DatabaseConfig): void
+        + retrieve_top_k(query: QueryTestPayload, config: DatabaseConfig): List[RetrievalResult]
+    }
+    
+    class RagasEvaluator implements Evaluator {
+        note: "Queries the Retriever dynamically to validate context scores"
+        + evaluate_pipeline(engine: Retriever, tests: List[QueryTestPayload], config: AppConfig): EvaluationMetrics
+    }
+    
+    class MarkdownFileReporter implements Reporter
+}
+
+' =====================================================================
+' 4. CONTEXT CORE (The Orchestrator)
+' =====================================================================
+package "Production Context Core" {
+    class AutoRAGPipeline {
+        - scraper: Scraper
+        - chunker: Chunker
+        - embedder: Embedder
+        - vector_db: VectorStore
+        - retriever: Retriever
+        - evaluator: Evaluator
+        - reporter: Reporter
+        + __init__(s: Scraper, c: Chunker, e: Embedder, v: VectorStore, r: Retriever, ev: Evaluator, rep: Reporter)
+        + ingest_and_verify_source(config: AppConfig, test_suite: List[QueryTestPayload]): void
+    }
+}
+
+' =====================================================================
+' 5. TESTING SUITE (Mocks & Verification Engine)
+' =====================================================================
+package "Testing Suite (CI/CD Quality Gates)" <<Cloud>> {
+    class TestAutoRAGPipeline <<UnitTest>>
+    
+    class MockVectorStoreStrategy <<TestMock>> implements VectorStore, Retriever {
+        note: "Simulates full db state loops entirely in-memory"
+        + saved_payloads: List[VectorPayload]
+        + load_vectors(payloads: List[VectorPayload], config: DatabaseConfig): void
+        + retrieve_top_k(query: QueryTestPayload, config: DatabaseConfig): List[RetrievalResult]
+    }
+}
+
+' --- Structural Composition (Has-A) ---
+AutoRAGPipeline *-- Scraper
+AutoRAGPipeline *-- Chunker
+AutoRAGPipeline *-- Embedder
+AutoRAGPipeline *-- VectorStore
+AutoRAGPipeline *-- Retriever
+AutoRAGPipeline *-- Evaluator
+AutoRAGPipeline *-- Reporter
+
+' --- Method-Level Runtime Parameter Dependencies ---
+AutoRAGPipeline ..> AppConfig
+Retriever ..> QueryTestPayload : "Processes query input"
+Retriever ..> RetrievalResult : "Yields search matches"
+Evaluator ..> Retriever : "Method Injection: Uses tool to run validation tests"
+Evaluator ..> QueryTestPayload : "Iterates through tests"
+
+' --- Testing Links ---
+TestAutoRAGPipeline ..> AutoRAGPipeline
+TestAutoRAGPipeline ..> MockVectorStoreStrategy
+
+@enduml
