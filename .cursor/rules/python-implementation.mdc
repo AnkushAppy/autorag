@@ -1,0 +1,58 @@
+---
+description: Python patterns — Pydantic models, async I/O, concurrency
+globs: "**/*.py"
+alwaysApply: false
+---
+
+# Python Implementation
+
+## Pydantic
+
+```python
+# ✅ GOOD — typed contract
+class DocumentChunk(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    text: str
+    metadata: DocumentMetadata
+
+# ❌ BAD — untyped payload
+def process(chunk: dict) -> dict: ...
+```
+
+- Use `SecretStr` for API keys. Use `Optional`/`Field` with defaults on configs.
+- Enums (`SourceType`) for fixed sets — not string literals scattered in code.
+
+## Single Responsibility + Open/Closed
+
+```python
+class FileExtractor(Protocol):
+    supported_extensions: list[str]
+    async def extract(self, path: Path, metadata: DocumentMetadata) -> str: ...
+```
+
+- One class, one job: `PdfExtractor` extracts only — no chunking, embedding, or state persistence inside it.
+- New formats = new class implementing the protocol + registry entry — no switch/if chains in the scraper core.
+- `AutoRAGPipeline` wires stages; it does not implement extraction or embedding logic itself.
+
+## Async + Concurrency
+
+```python
+async def stream_documents(...) -> AsyncIterator[Result[DocumentChunk, PipelineError]]:
+    sem = asyncio.Semaphore(config.max_concurrent_files)
+    async for path in self._walk(...):
+        async with sem:
+            yield await self._process_file(path, config)
+
+async def _extract_pdf(self, path: Path) -> str:
+    return await asyncio.to_thread(self._pdf_extract_sync, path)
+```
+
+- I/O-bound: `async` + `gather` + semaphores.
+- Blocking sync libs: thread pool via `to_thread` / executor.
+- Never call blocking I/O directly inside `async def` without offloading.
+
+## TDD in Python
+
+- `pytest` + `pytest-asyncio` for async tests.
+- Test file mirrors source: `tests/unit/scraper/test_local_file_system_scraper.py`.
+- Use mocks from the UML testing package before real Pinecone/OpenAI in unit tests.

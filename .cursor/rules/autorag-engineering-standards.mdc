@@ -1,0 +1,59 @@
+---
+description: Core engineering standards for Auto-RAG — TDD, SRP, design patterns, SRE
+alwaysApply: true
+---
+
+# Auto-RAG Engineering Standards
+
+These rules apply to all work in this repo (docs, schemas, pipeline code, tests).
+
+## 1. TDD First
+
+- Write or update a failing test **before** production code.
+- Every behavior change ships with a test that would fail without the change.
+- Prefer unit tests with mocks from `doc/Auto_RAG_Pipeline_V4.puml` (`MockScraper`, `InMemoryStateStore`, `CapturingProgressReporter`).
+- Red → green → refactor. Do not merge untested paths.
+
+## 2. Always Pydantic
+
+- All data contracts, configs, events, and errors are `pydantic.BaseModel` (see UML "Data Contracts").
+- No raw `dict` for domain payloads. Use typed models: `DocumentMetadata`, `DocumentChunk`, `PipelineError`, etc.
+- Validate at boundaries (config load, scraper output, API inputs). Fail fast with clear validation errors.
+
+## 3. DRY
+
+- Extract shared logic once a pattern appears twice — not preemptively.
+- Reuse schemas and protocols; do not duplicate field definitions or validation rules.
+- Shared test fixtures live in `tests/conftest.py` or `tests/fixtures/`.
+
+## 4. Single Responsibility (SRP)
+
+- Each class/module has **one reason to change** — one job in the pipeline.
+- Split by role: extract (`FileExtractor`), clean (`TextPreprocessor`), route (`FileExtractorRegistry`), orchestrate (`LocalFileSystemScraper`), coordinate (`AutoRAGPipeline`).
+- If a function both parses PDFs and writes to the vector store, split it. If a module mixes config validation with HTTP calls, split it.
+- Tests mirror this: one test module per production module; one assertion focus per test where practical.
+
+## 5. Open/Closed (OCP)
+
+- Extend via new implementations of `typing.Protocol` interfaces — do not modify existing call sites.
+- Examples: new `FileExtractor`, `TextPreprocessor`, `Embedder`, `VectorStore` registered in a registry/wrapper.
+- Orchestrator (`AutoRAGPipeline`) stays closed; strategies stay open for extension.
+
+## 6. SRE Patterns
+
+- **Observability**: emit structured events via `ProgressReporter`; log with context (`source_path`, `stage`, `duration_ms`).
+- **Reliability**: use `Result[T, E]` per file — never let one failure abort a stream. Route errors through `ErrorHandler` + circuit breaker.
+- **Operability**: expose run metrics (`ScraperRunMetrics`), idempotent ingestion (`content_hash`, `FileIngestionRecord`), and stale cleanup.
+- **Config**: timeouts, retries, concurrency limits, and size caps are explicit in Pydantic configs — no magic constants in code.
+
+## 7. Async Always
+
+- Public pipeline and I/O APIs are `async def` / `AsyncIterator`.
+- Scraper entry point: `stream_documents()` — not batch `fetch_text()`.
+- Use `asyncio` for orchestration, semaphores, and concurrent I/O — not blocking loops in async code.
+
+## 8. Concurrency Where It Helps
+
+- Parallelize independent work: file processing (`asyncio.Semaphore`), embedding batches (`asyncio.gather`), concurrent store writes where safe.
+- CPU-bound or blocking libraries (PDF, DOCX): offload with `asyncio.to_thread` / `run_in_executor` — do not block the event loop.
+- Concurrency limits come from config (`max_concurrent_files`, `batch_size`) — never unbounded fan-out.
