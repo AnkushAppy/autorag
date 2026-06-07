@@ -1,0 +1,614 @@
+@startuml Auto_RAG_Pipeline_V4
+
+' --- Configuration & Styling ---
+skinparam monochrome false
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam groupInheritance 2
+
+title Enterprise Auto-RAG Pipeline — Architectural Blueprint V4\n(Streaming Scraper · File Router · Preprocessors · Dedup · Observability · Concurrency)
+
+' =====================================================================
+' 1. DATA CONTRACTS
+' =====================================================================
+package "Data Contracts (Schemas)" {
+
+    ' --- Enums ---
+    enum SourceType {
+        SINGLE_URL
+        WEBSITE_CRAWL
+        SINGLE_FILE
+        DIRECTORY_FOLDER
+    }
+
+    ' NEW: Typed metadata replaces raw dict on DocumentChunk.
+    '      Carries full provenance from source file to RetrievalResult.
+    class DocumentMetadata <<Pydantic.BaseModel>> {
+        + source_path: str
+        + source_type: SourceType
+        + file_name: str
+        + file_extension: str
+        + page_number: Optional[int]
+        + total_pages: Optional[int]
+        + char_offset_start: int
+        + char_offset_end: int
+        + word_count: int
+        + language: Optional[str]
+        + scraped_at: datetime
+        + content_hash: str
+    }
+
+    ' CHANGED: metadata field is now DocumentMetadata, not raw dict.
+    '          Provenance is first-class from the moment a chunk is created.
+    class DocumentChunk <<Pydantic.BaseModel>> {
+        + text: str
+        + metadata: DocumentMetadata
+    }
+
+    ' NEW: Tracks ingestion state per file for incremental/idempotent runs.
+    class FileIngestionRecord <<Pydantic.BaseModel>> {
+        + source_path: str
+        + content_hash: str
+        + ingested_at: datetime
+        + chunk_ids: List[str]
+    }
+
+    ' NEW: Per-file scraping outcome emitted to ProgressReporter.
+    class FileScrapedEvent <<Pydantic.BaseModel>> {
+        + source_path: str
+        + chunks_produced: int
+        + bytes_read: int
+        + duration_ms: int
+        + skipped: bool
+        + skip_reason: Optional[str]
+    }
+
+    ' NEW: Aggregate metrics for a full scraper run.
+    class ScraperRunMetrics <<Pydantic.BaseModel>> {
+        + files_discovered: int
+        + files_skipped_unchanged: int
+        + files_skipped_too_large: int
+        + files_failed: int
+        + files_succeeded: int
+        + total_bytes_read: int
+        + total_pages_processed: int
+        + total_chunks_produced: int
+        + extraction_duration_seconds: float
+    }
+
+    ' --- Component-scoped configs ---
+    ' CHANGED: ScraperConfig gains concurrency, size limit, encoding fallbacks,
+    '          and a list of pre-processing steps (applied in order after extraction).
+    class ScraperConfig <<Pydantic.BaseModel>> {
+        + target_path_or_url: str
+        + source_type: SourceType
+        + crawl_depth: int = 1
+        + allowed_extensions: List[str]
+        + timeout_seconds: int = 30
+        + max_retries: int = 3
+        + max_concurrent_files: int = 10
+        + max_file_size_mb: float = 50.0
+        + encoding_fallbacks: List[str] = ["utf-8","latin-1","cp1252"]
+        + preprocessors: List[TextPreprocessor]
+    }
+
+    class ChunkerConfig <<Pydantic.BaseModel>> {
+        + strategy_name: str
+        + chunk_size: int
+        + chunk_overlap: int
+    }
+
+    class EmbedderConfig <<Pydantic.BaseModel>> {
+        + provider: str
+        + model_name: str
+        + batch_size: int = 100
+    }
+
+    class VectorStoreConfig <<Pydantic.BaseModel>> {
+        + url: str
+        + api_key: SecretStr
+        + index_name: str
+        + timeout_seconds: int = 10
+    }
+
+    class EvaluatorConfig <<Pydantic.BaseModel>> {
+        + llm_judge_model_name: str
+        + temperature: float
+    }
+
+    ' Threshold policy — measurement vs policy remain separate.
+    class EvaluationPolicy <<Pydantic.BaseModel>> {
+        + min_context_precision: float = 0.7
+        + min_faithfulness: float = 0.8
+        + min_answer_relevance: float = 0.75
+        + evaluate(metrics: EvaluationMetrics): bool
+    }
+
+    class ReporterConfig <<Pydantic.BaseModel>> {
+        + output_path: str
+        + emit_to_slack: bool = false
+        + s3_bucket: Optional[str]
+    }
+
+    ' --- Pipeline domain objects ---
+    class VectorPayload <<Pydantic.BaseModel>> {
+        + chunk_id: str
+        + vector: List[float]
+        + text: str
+        + metadata: DocumentMetadata
+    }
+
+    class QueryTestPayload <<Pydantic.BaseModel>> {
+        + test_query_text: str
+        + expected_ground_truth: str
+        + top_k: int = 5
+    }
+
+    ' CHANGED: metadata typed as DocumentMetadata — provenance survives to query results.
+    class RetrievalResult <<Pydantic.BaseModel>> {
+        + text: str
+        + score: float
+        + metadata: DocumentMetadata
+    }
+
+    class EvaluationMetrics <<Pydantic.BaseModel>> {
+        + context_precision: float
+        + faithfulness: float
+        + answer_relevance: float
+    }
+
+    ' NEW: result type — scraper yields Ok or Err per file, never raises mid-stream.
+    class Result<T, E> <<Generic>> {
+        + ok: Optional[T]
+        + err: Optional[E]
+        + is_ok(): bool
+    }
+
+    class PipelineError <<Pydantic.BaseModel>> {
+        + stage: str
+        + source_path: Optional[str]
+        + message: str
+        + retryable: bool
+        + original_exception: Optional[str]
+    }
+}
+
+' =====================================================================
+' 2. SCRAPER SUBSYSTEM INTERFACES
+' NEW package — the scraper is now a mini-ecosystem of composable protocols.
+' =====================================================================
+package "Scraper Subsystem (Interfaces)" {
+
+    ' CHANGED: fetch_text() → stream_documents().
+    '          Returns AsyncIterator so chunker/embedder start work immediately.
+    '          Yields Result so a single bad file never aborts the run.
+    interface Scraper <<Protocol>> {
+        + async stream_documents(
+            config: ScraperConfig,
+            progress: ProgressReporter
+          ): AsyncIterator[Result[DocumentChunk, PipelineError]]
+    }
+
+    ' NEW: Knows how to extract raw text from one file type.
+    '      Registry maps extensions → extractors at startup.
+    interface FileExtractor <<Protocol>> {
+        + supported_extensions: List[str]
+        + async extract(path: Path, metadata: DocumentMetadata): str
+    }
+
+    ' NEW: Composable text cleaning step applied after extraction, before chunking.
+    interface TextPreprocessor <<Protocol>> {
+        + process(text: str, metadata: DocumentMetadata): str
+    }
+
+    ' NEW: Tracks per-file ingestion state for dedup and stale-vector cleanup.
+    interface ScraperStateStore <<Protocol>> {
+        + async get_record(path: str): Optional[FileIngestionRecord]
+        + async save_record(record: FileIngestionRecord): void
+        + async list_stale(current_paths: List[str]): List[FileIngestionRecord]
+    }
+
+    ' NEW: Observability sink — receives structured events during scraping.
+    interface ProgressReporter <<Protocol>> {
+        + on_file_start(path: str, size_bytes: int): void
+        + on_file_complete(event: FileScrapedEvent): void
+        + on_file_error(path: str, error: PipelineError): void
+        + on_run_complete(metrics: ScraperRunMetrics): void
+    }
+}
+
+' =====================================================================
+' 3. REMAINING PIPELINE INTERFACES
+' =====================================================================
+package "Functional Contracts (Interfaces)" {
+
+    ' CHANGED: accepts List[DocumentChunk] with typed metadata — no text-joining needed.
+    interface Chunker <<Protocol>> {
+        + split(chunk: DocumentChunk, config: ChunkerConfig): List[DocumentChunk]
+    }
+
+    interface Embedder <<Protocol>> {
+        + async generate_embeddings(
+            chunks: List[DocumentChunk],
+            config: EmbedderConfig
+          ): List[VectorPayload]
+    }
+
+    interface VectorStore <<Protocol>> {
+        + async load_vectors(payloads: List[VectorPayload], config: VectorStoreConfig): void
+        + async delete_by_chunk_ids(chunk_ids: List[str], config: VectorStoreConfig): void
+    }
+
+    interface Retriever <<Protocol>> {
+        + async retrieve_top_k(
+            query: QueryTestPayload,
+            config: VectorStoreConfig
+          ): List[RetrievalResult]
+    }
+
+    interface Evaluator <<Protocol>> {
+        + async evaluate_pipeline(
+            engine: Retriever,
+            tests: List[QueryTestPayload],
+            config: EvaluatorConfig
+          ): EvaluationMetrics
+    }
+
+    interface Reporter <<Protocol>> {
+        + async generate_report(
+            metrics: EvaluationMetrics,
+            passed: bool,
+            config: ReporterConfig
+          ): void
+    }
+
+    interface ErrorHandler <<Protocol>> {
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+}
+
+' =====================================================================
+' 4. SCRAPER SUBSYSTEM — CONCRETE IMPLEMENTATIONS
+' =====================================================================
+package "Scraper Subsystem (Concrete)" {
+
+    ' --- File extractors (one per format) ---
+    class PdfExtractor implements FileExtractor {
+        + supported_extensions: [".pdf"]
+        + async extract(path, metadata): str
+        ' Uses pdfplumber; runs in thread-pool executor (non-blocking).
+        ' Populates metadata.page_number and metadata.total_pages per page.
+    }
+
+    class TextExtractor implements FileExtractor {
+        + supported_extensions: [".txt", ".log", ".csv"]
+        + async extract(path, metadata): str
+        ' Tries ScraperConfig.encoding_fallbacks in order.
+    }
+
+    class DocxExtractor implements FileExtractor {
+        + supported_extensions: [".docx"]
+        + async extract(path, metadata): str
+        ' Uses python-docx; preserves heading hierarchy in metadata.
+    }
+
+    class HtmlExtractor implements FileExtractor {
+        + supported_extensions: [".html", ".htm"]
+        + async extract(path, metadata): str
+        ' Uses trafilatura for boilerplate removal.
+    }
+
+    class MarkdownExtractor implements FileExtractor {
+        + supported_extensions: [".md", ".mdx"]
+        + async extract(path, metadata): str
+        ' Strips front-matter; preserves heading structure.
+    }
+
+    ' NEW: Registry — maps extensions to extractors at startup.
+    '      LocalFileSystemScraper delegates all format logic here.
+    class FileExtractorRegistry {
+        - extractors: List[FileExtractor]
+        + register(extractor: FileExtractor): void
+        + get(extension: str): FileExtractor
+        + supported_extensions(): List[str]
+    }
+
+    ' --- Text preprocessors (composable, applied left-to-right) ---
+    class FooterStripper implements TextPreprocessor {
+        ' Removes repeated page footers / headers detected by line frequency.
+    }
+    class WhitespaceNormalizer implements TextPreprocessor {
+        ' Collapses runs of whitespace; normalises Unicode line endings.
+    }
+    class LanguageDetector implements TextPreprocessor {
+        ' Detects language via langdetect; sets metadata.language.
+    }
+    class BoilerplateFilter implements TextPreprocessor {
+        ' Strips nav, cookie banners, legal boilerplate (web sources).
+    }
+    class PiiRedactor implements TextPreprocessor {
+        ' Redacts email, phone, SSN patterns before text leaves scraper.
+    }
+
+    ' NEW: Chains preprocessors in declared order from ScraperConfig.
+    class PreprocessorPipeline implements TextPreprocessor {
+        - steps: List[TextPreprocessor]
+        + process(text, metadata): str
+        ' Folds steps left-to-right: each step receives output of previous.
+    }
+
+    ' --- State stores ---
+    class SqliteStateStore implements ScraperStateStore {
+        ' Lightweight local SQLite — suitable for single-node runs.
+        + async get_record(path): Optional[FileIngestionRecord]
+        + async save_record(record): void
+        + async list_stale(current_paths): List[FileIngestionRecord]
+    }
+
+    class RedisStateStore implements ScraperStateStore {
+        ' Distributed state — suitable for multi-worker deployments.
+        + async get_record(path): Optional[FileIngestionRecord]
+        + async save_record(record): void
+        + async list_stale(current_paths): List[FileIngestionRecord]
+    }
+
+    ' --- Progress reporters ---
+    class LoggingProgressReporter implements ProgressReporter {
+        ' Emits structured JSON log lines per file event.
+    }
+    class PrometheusProgressReporter implements ProgressReporter {
+        ' Increments Prometheus counters/histograms per file event.
+    }
+
+    ' NEW: Primary local-file scraper implementation.
+    '      Orchestrates: walk → hash check → semaphore → extract → preprocess → yield.
+    class LocalFileSystemScraper implements Scraper {
+        - registry: FileExtractorRegistry
+        - preprocessor: TextPreprocessor
+        - state_store: ScraperStateStore
+        - semaphore: asyncio.Semaphore
+        + async stream_documents(
+            config: ScraperConfig,
+            progress: ProgressReporter
+          ): AsyncIterator[Result[DocumentChunk, PipelineError]]
+        - _walk(root, extensions, depth): List[Path]
+        - _should_skip(path, config): Tuple[bool, str]
+        ' Skip if: extension not allowed | size > max_file_size_mb |
+        '          content_hash matches existing FileIngestionRecord.
+        - async _process_file(path, config): Result[DocumentChunk, PipelineError]
+        ' On success: save FileIngestionRecord with new content_hash + chunk_ids.
+        ' On unchanged hash: yield skip event, do not re-embed.
+        ' On failure: yield PipelineError(retryable=True/False per exception type).
+    }
+
+    ' Existing web scraper — unchanged interface, now returns stream.
+    class PlaywrightWebScraper implements Scraper {
+        + async stream_documents(
+            config: ScraperConfig,
+            progress: ProgressReporter
+          ): AsyncIterator[Result[DocumentChunk, PipelineError]]
+    }
+}
+
+' =====================================================================
+' 5. REMAINING PIPELINE — CONCRETE IMPLEMENTATIONS
+' =====================================================================
+package "Pipeline Concrete Strategies" {
+
+    class TokenChunker implements Chunker
+
+    class OpenAIEmbeddingStrategy implements Embedder {
+        ' asyncio.gather over batches sized by EmbedderConfig.batch_size
+    }
+
+    class PineconeVectorStore implements VectorStore {
+        - connection_pool: AsyncConnectionPool
+        + async load_vectors(payloads, config): void
+        ' NEW: delete_by_chunk_ids used to remove stale vectors after
+        '      ScraperStateStore.list_stale() identifies deleted source files.
+        + async delete_by_chunk_ids(chunk_ids, config): void
+    }
+
+    class PineconeRetriever implements Retriever {
+        - connection_pool: AsyncConnectionPool
+        + async retrieve_top_k(query, config): List[RetrievalResult]
+    }
+
+    class CohereReRanker implements Retriever {
+        - inner: Retriever
+        + async retrieve_top_k(query, config): List[RetrievalResult]
+        ' Calls inner.retrieve_top_k(), re-scores via Cohere Rerank API.
+    }
+
+    class RagasEvaluator implements Evaluator
+
+    class MultiSinkReporter implements Reporter {
+        + async generate_report(metrics, passed, config): void
+        - async _write_markdown(metrics, path): void
+        - async _post_slack(metrics, passed): void
+        - async _upload_s3(metrics, bucket): void
+    }
+
+    class RetryCircuitBreakerHandler implements ErrorHandler {
+        - failure_counts: dict
+        - circuit_open_until: dict
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+}
+
+' =====================================================================
+' 6. ORCHESTRATOR
+' CHANGED: run() consumes AsyncIterator from scraper stream.
+'          Stale-vector cleanup integrated as first step of run().
+'          ProgressReporter injected at call site for observability.
+' =====================================================================
+package "Production Context Core" {
+    class AutoRAGPipeline {
+        - scraper: Scraper
+        - chunker: Chunker
+        - embedder: Embedder
+        - vector_db: VectorStore
+        - retriever: Retriever
+        - evaluator: Evaluator
+        - reporter: Reporter
+        - error_handler: ErrorHandler
+        - policy: EvaluationPolicy
+        - state_store: ScraperStateStore
+        + __init__(scraper, chunker, embedder, vector_db, retriever,
+            evaluator, reporter, error_handler, policy, state_store)
+        + async run(
+            scraper_cfg: ScraperConfig,
+            chunker_cfg: ChunkerConfig,
+            embedder_cfg: EmbedderConfig,
+            store_cfg: VectorStoreConfig,
+            eval_cfg: EvaluatorConfig,
+            reporter_cfg: ReporterConfig,
+            progress: ProgressReporter,
+            test_suite: List[QueryTestPayload]
+          ): void
+        ' Step 0: list_stale() → delete_by_chunk_ids() for removed source files.
+        ' Step 1: async for result in scraper.stream_documents():
+        '           Ok  → chunker.split() → embedder.generate_embeddings() → vector_db.load_vectors()
+        '           Err → error_handler.handle(); skip if circuit open
+        ' Step 2: evaluator.evaluate_pipeline() → raw EvaluationMetrics
+        ' Step 3: passed = policy.evaluate(metrics)
+        ' Step 4: reporter.generate_report(metrics, passed, reporter_cfg)
+    }
+}
+
+' =====================================================================
+' 7. TESTING SUITE
+' NEW: MockLocalScraper + MockProgressReporter added for scraper unit tests.
+' =====================================================================
+package "Testing Suite (CI/CD Quality Gates)" <<Cloud>> {
+
+    class TestAutoRAGPipeline <<UnitTest>>
+    class TestLocalFileSystemScraper <<UnitTest>>
+    class TestPreprocessorPipeline <<UnitTest>>
+    class TestFileExtractorRegistry <<UnitTest>>
+
+    class MockScraper <<TestMock>> implements Scraper {
+        + canned_chunks: List[DocumentChunk]
+        + async stream_documents(config, progress):
+            AsyncIterator[Result[DocumentChunk, PipelineError]]
+        ' Yields canned_chunks as Ok results; can inject Err at any position.
+    }
+
+    class MockVectorStore <<TestMock>> implements VectorStore {
+        + saved_payloads: List[VectorPayload]
+        + deleted_chunk_ids: List[str]
+        + async load_vectors(payloads, config): void
+        + async delete_by_chunk_ids(chunk_ids, config): void
+    }
+
+    class MockRetriever <<TestMock>> implements Retriever {
+        + canned_results: List[RetrievalResult]
+        + async retrieve_top_k(query, config): List[RetrievalResult]
+    }
+
+    class InMemoryStateStore <<TestMock>> implements ScraperStateStore {
+        + records: dict
+        + async get_record(path): Optional[FileIngestionRecord]
+        + async save_record(record): void
+        + async list_stale(current_paths): List[FileIngestionRecord]
+    }
+
+    class CapturingProgressReporter <<TestMock>> implements ProgressReporter {
+        + events: List[FileScrapedEvent]
+        + errors: List[PipelineError]
+        + final_metrics: Optional[ScraperRunMetrics]
+        ' Lets tests assert on exactly which files were skipped, failed, or produced N chunks.
+    }
+
+    class StubErrorHandler <<TestMock>> implements ErrorHandler {
+        + captured_errors: List[PipelineError]
+        + async handle(error: PipelineError): void
+        + is_circuit_open(stage: str): bool
+    }
+}
+
+' =====================================================================
+' RELATIONSHIPS
+' =====================================================================
+
+' --- Scraper subsystem internal composition ---
+LocalFileSystemScraper *-- FileExtractorRegistry
+LocalFileSystemScraper *-- TextPreprocessor
+LocalFileSystemScraper *-- ScraperStateStore
+LocalFileSystemScraper ..> ProgressReporter     : "emits events to"
+LocalFileSystemScraper ..> Result               : "yields per file"
+LocalFileSystemScraper ..> PipelineError        : "wraps failures in Result.err"
+
+FileExtractorRegistry o-- FileExtractor         : "routes extension →"
+PreprocessorPipeline  o-- TextPreprocessor      : "chains steps"
+
+' --- Scraper → domain objects ---
+Scraper ..> DocumentChunk   : "streams"
+Scraper ..> DocumentMetadata : "populates per file"
+DocumentChunk *-- DocumentMetadata
+
+' --- Dedup / stale cleanup ---
+ScraperStateStore ..> FileIngestionRecord       : "persists"
+AutoRAGPipeline   ..> ScraperStateStore         : "list_stale before run"
+AutoRAGPipeline   ..> VectorStore               : "delete_by_chunk_ids for stale files"
+
+' --- Orchestrator structural composition ---
+AutoRAGPipeline *-- Scraper
+AutoRAGPipeline *-- Chunker
+AutoRAGPipeline *-- Embedder
+AutoRAGPipeline *-- VectorStore
+AutoRAGPipeline *-- Retriever
+AutoRAGPipeline *-- Evaluator
+AutoRAGPipeline *-- Reporter
+AutoRAGPipeline *-- ErrorHandler
+AutoRAGPipeline *-- EvaluationPolicy
+AutoRAGPipeline *-- ScraperStateStore
+
+' --- Scoped config flow ---
+AutoRAGPipeline ..> ScraperConfig     : "run() passes →"
+AutoRAGPipeline ..> ChunkerConfig     : "run() passes →"
+AutoRAGPipeline ..> EmbedderConfig    : "run() passes →"
+AutoRAGPipeline ..> VectorStoreConfig : "run() passes →"
+AutoRAGPipeline ..> EvaluatorConfig   : "run() passes →"
+AutoRAGPipeline ..> ReporterConfig    : "run() passes →"
+AutoRAGPipeline ..> ProgressReporter  : "run() passes →"
+
+' --- Policy gate ---
+EvaluationPolicy ..> EvaluationMetrics : "evaluates raw metrics"
+
+' --- Retriever pipeline ---
+Retriever ..> QueryTestPayload  : "consumes"
+Retriever ..> RetrievalResult   : "produces"
+Evaluator ..> Retriever         : "method injection"
+Evaluator ..> EvaluationMetrics : "produces"
+
+' --- Re-ranker decorator ---
+CohereReRanker o-- Retriever : "wraps inner"
+
+' --- Error routing ---
+AutoRAGPipeline ..> ErrorHandler  : "delegates stage errors"
+AutoRAGPipeline ..> PipelineError : "constructs on stage failure"
+
+' --- Metadata propagation (end-to-end) ---
+DocumentMetadata ..> VectorPayload     : "carried through embedder"
+DocumentMetadata ..> RetrievalResult   : "surfaced in query results"
+
+' --- Testing ---
+TestAutoRAGPipeline          ..> AutoRAGPipeline
+TestAutoRAGPipeline          ..> MockScraper
+TestAutoRAGPipeline          ..> MockVectorStore
+TestAutoRAGPipeline          ..> MockRetriever
+TestAutoRAGPipeline          ..> InMemoryStateStore
+TestAutoRAGPipeline          ..> CapturingProgressReporter
+TestAutoRAGPipeline          ..> StubErrorHandler
+TestLocalFileSystemScraper   ..> LocalFileSystemScraper
+TestLocalFileSystemScraper   ..> InMemoryStateStore
+TestLocalFileSystemScraper   ..> CapturingProgressReporter
+TestPreprocessorPipeline     ..> PreprocessorPipeline
+TestFileExtractorRegistry    ..> FileExtractorRegistry
+
+@enduml
